@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Aura Explode</title>
+<style>
+  :root { --blur: 10px; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #0e0f13; color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: none; }
+
+  /* Home screen */
+  #home { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; padding: 24px; }
+  #pasteBtn {
+    font-size: 22px; font-weight: 600; padding: 18px 48px;
+    border: none; border-radius: 16px; cursor: pointer;
+    background: linear-gradient(135deg, #ff6b3d, #ffb13d); color: white;
+    box-shadow: 0 10px 30px rgba(255, 107, 61, .4);
+    transition: transform .15s;
+  }
+  #pasteBtn:active { transform: scale(.96); }
+  #hint { opacity: .6; font-size: 14px; max-width: 360px; }
+  #error { color: #ff7b7b; font-size: 14px; min-height: 1em; }
+
+  /* Image view */
+  #viewer { display: none; position: fixed; inset: 0; align-items: center; justify-content: center; }
+  #stage { position: relative; line-height: 0; }
+  #stage img { max-width: 100vw; max-height: 100vh; display: block; user-select: none; -webkit-user-drag: none; }
+  .icon-box {
+    position: absolute; border-radius: 22%;
+    backdrop-filter: blur(0px); -webkit-backdrop-filter: blur(0px);
+    transition: backdrop-filter .25s ease, -webkit-backdrop-filter .25s ease;
+    pointer-events: none;
+  }
+  .icon-box.badge { border-radius: 999px; }
+  .icon-box.gone { backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur)); }
+  #stage.debug .icon-box { outline: 2px solid rgba(0,255,140,.85); }
+  #fx { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 2; }
+  #resetBtn {
+    position: fixed; right: 14px; bottom: 14px; z-index: 3; display: none;
+    width: 44px; height: 44px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(0,0,0,.45); color: #fff; font-size: 22px; line-height: 44px;
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  }
+</style>
+</head>
+<body>
+
+<div id="home">
+  <button id="pasteBtn">📋 Paste</button>
+  <div id="hint">Copy a screenshot, then click “Paste” (or press Ctrl/⌘ + V). Then tap an icon to blow it up.</div>
+  <div id="error"></div>
+</div>
+
+<div id="viewer">
+  <div id="stage"><img id="img" alt="" /></div>
+</div>
+<canvas id="fx"></canvas>
+<button id="resetBtn" title="Restore icons (R)">↺</button>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const home = $('home'), viewer = $('viewer'), stage = $('stage'), img = $('img');
+
+let currentImage = null; // loaded HTMLImageElement
+
+/* ---------- Reading the clipboard ---------- */
+
+$('pasteBtn').addEventListener('click', async () => {
+  $('error').textContent = '';
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.read) throw new Error('unsupported');
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const type = item.types.find((t) => t.startsWith('image/'));
+      if (type) return loadFromBlob(await item.getType(type));
+    }
+    $('error').textContent = "No image in the clipboard.";
+  } catch (e) {
+    $('error').textContent = e.message === 'unsupported'
+      ? "Your browser doesn't support reading the clipboard directly: use Ctrl/⌘ + V."
+      : "Clipboard access denied. Try Ctrl/⌘ + V.";
+  }
+});
+
+// Fallback: Ctrl/⌘ + V at any time
+window.addEventListener('paste', (e) => {
+  const file = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'))?.getAsFile();
+  if (file) { e.preventDefault(); loadFromBlob(file); }
+});
+
+function loadFromBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  const im = new Image();
+  im.onload = () => {
+    currentImage = im;
+    img.src = url;
+    home.style.display = 'none';
+    viewer.style.display = 'flex';
+    $('resetBtn').style.display = 'block';
+    img.decode().catch(() => {}).then(runDetection);
+  };
+  im.onerror = () => { $('error').textContent = "Unable to read the image."; };
+  im.src = url;
+}
+window.loadFromBlob = loadFromBlob;
+
+/* ---------- Icon detection (same as Aura Fluid) ---------- */
+
+/* ---------- Icon detection ---------- */
+
+// Approach: a coarse pass on a downscaled image finds the icons (home-screen grid,
+// otherwise generic analysis), then each edge is measured at full resolution and, in grid mode,
+// all icons are snapped to a common size and to shared rows / columns.
+function detectIcons(image) {
+  const nw = image.naturalWidth, nh = image.naturalHeight;
+  const grab = (w, h) => {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, w, h);
+    return ctx.getImageData(0, 0, w, h).data;
+  };
+
+  // 1. Downscale for the coarse analysis
+  const MAX = 1000;
+  const scale = Math.min(1, MAX / Math.max(nw, nh));
+  const W = Math.max(1, Math.round(nw * scale));
+  const H = Math.max(1, Math.round(nh * scale));
+  const px = grab(W, H);
+
+  // 2. Edge strength (color gradient)
+  const grad = new Uint16Array(W * H);
+  for (let y = 0; y < H - 1; y++) {
+    for (let x = 0; x < W - 1; x++) {
+      const p = y * W + x, i = p * 4, r = i + 4, d = i + W * 4;
+      let g = 0;
+      for (let c = 0; c < 3; c++) {
+        g = Math.max(g, Math.abs(px[i + c] - px[r + c]) + Math.abs(px[i + c] - px[d + c]));
+      }
+      grad[p] = g;
+    }
+  }
+
+  // 3. Home screen? Look for a regular grid of same-size icons
+  //    (much more reliable on a photo wallpaper). Otherwise: generic analysis.
+  const squares = findSquares(px, grad, W, H);
+  const grid = detectGrid(px, grad, W, H, squares);
+  // off-grid: connected components + confident squares (which recover icons stuck to their label)
+  const coarse = grid || detectLoose(px, grad, W, H).concat(squares.filter((q) => q.score >= 0.8));
+
+  // 4. Fine measurement at full resolution (capped for very large images)
+  const fs = Math.min(1, 3000 / Math.max(nw, nh));
+  const FW = Math.max(1, Math.round(nw * fs)), FH = Math.max(1, Math.round(nh * fs));
+  const fpx = scale === fs ? px : grab(FW, FH);
+  const kx = FW / W, ky = FH / H;
+  let approx = coarse.map((b) => ({ x: b.x * kx, y: b.y * ky, w: b.w * kx, h: b.h * ky, weak: b.weak, group: b.group }));
+  // (off-grid, the coarse box is less reliable: search for the edge further out)
+  let meas = approx.map((b) => measureEdges(fpx, FW, FH, b, grid ? 0.1 : 0.2, !!grid));
+  if (grid) {
+    // each cell must show real straight edges, in the right place, at full resolution:
+    // at least 2 for a confident cell, 3 for a doubtful one (otherwise: empty cell, widget, wallpaper pattern…)
+    const keep = approx.map((b, i) => confirmCell(b, meas[i], b.weak ? 3 : 2));
+    approx = approx.filter((b, i) => keep[i]);
+    meas = meas.filter((m, i) => keep[i]);
+  }
+  const tight = grid ? alignGrid(approx, meas) : looseBoxes(approx, meas, fpx, FW, FH);
+
+  // 5. Outputs in relative coordinates (0..1):
+  //    cut = flush with the icon (it doesn't take wallpaper with it when falling),
+  //    box = blurred area, with a small margin (folder rim, anti-aliasing).
+  const rel = (b) => ({ x: b.x / FW, y: b.y / FH, w: b.w / FW, h: b.h / FH });
+  const grow = (b, m) => ({ x: b.x - m, y: b.y - m, w: b.w + 2 * m, h: b.h + 2 * m });
+  const out = tight.map((b) => ({ ...rel(grow(b, 0.025 * b.w + 2)), cut: rel(b) }));
+
+  // 6. Notification badges (red, top right of the icon)
+  tight.forEach((b, i) => {
+    const badge = findBadge(fpx, FW, FH, b);
+    if (badge) out.push({ ...rel(grow(badge, 0.04 * badge.h + 1)), cut: rel(badge), badge: true, of: i });
+  });
+  return out;
+}
+
+// Generic analysis (screenshots other than the home screen): connected components of edges,
+// multi-threshold (low-contrast icons) and multi-scale:
+//   small dilation = keeps the icon separate from its label,
+//   large dilation = joins the pieces of a line-art icon.
+function detectLoose(px, grad, W, H) {
+  const N = W * H, minDim = Math.min(W, H);
+  const color = new Uint8Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    color[p] = Math.max(px[i], px[i + 1], px[i + 2]) - Math.min(px[i], px[i + 1], px[i + 2]) > 50 ? 1 : 0;
+  }
+  const colorSum = integral(color, W, H);
+  const sumIn = (S, b) => {
+    const x0 = Math.max(0, Math.floor(b.x)), y0 = Math.max(0, Math.floor(b.y));
+    const x1 = Math.min(W, Math.ceil(b.x + b.w)), y1 = Math.min(H, Math.ceil(b.y + b.h));
+    if (x1 <= x0 || y1 <= y0) return 0;
+    const w1 = W + 1;
+    return S[y1 * w1 + x1] - S[y0 * w1 + x1] - S[y1 * w1 + x0] + S[y0 * w1 + x0];
+  };
+
+  const minSide = Math.max(8, minDim * 0.045); // smaller: text, not an icon
+  const maxSide = minDim * 0.45;
+  const isIconShape = (b) =>
+    b.w >= minSide && b.h >= minSide && b.w <= maxSide && b.h <= maxSide &&
+    b.w / b.h >= 0.8 && b.w / b.h <= 1.25 &&
+    b.x > 1 && b.y > 1 && b.x + b.w < W - 1 && b.y + b.h < H - 1; // cut by the image border: ignore
+
+  const unit = Math.max(1, minDim / 500);
+  const radii = [...new Set([1, 2, 3, 5, 8].map((r) => Math.max(1, Math.round(r * unit))))];
+  const candidates = [];
+  for (const T of [22, 40]) {
+    const edge = new Uint8Array(N);
+    for (let p = 0; p < N; p++) edge[p] = grad[p] > T ? 1 : 0;
+    const edgeSum = integral(edge, W, H);
+    for (const R of radii) {
+      const boxes = components(dilate(edge, W, H, R), W, H)
+        .map((b) => ({ x: b.x + R, y: b.y + R, w: b.w - 2 * R, h: b.h - 2 * R }))
+        .filter((b) => b.w > 2 && b.h > 2);
+
+      for (const b of boxes) {
+        if (!isIconShape(b)) continue;
+        const area = b.w * b.h;
+        const edges = sumIn(edgeSum, b);
+        if (edges < (b.w + b.h) * 0.9) continue;          // too empty
+        if (edges > area * 0.55) continue;                 // texture / noise
+        const colorful = sumIn(colorSum, b) / area;
+        // Text rejection: a letter has neighbors of the same height, aligned and very close.
+        if (colorful < 0.15 && looksLikeText(b, boxes)) continue;
+        candidates.push(b);
+      }
+    }
+  }
+
+  // Merge candidates from the different scales
+  const squareness = (b) => Math.min(b.w, b.h) / Math.max(b.w, b.h); // 1 = perfect square
+  candidates.sort((a, b) => a.w * a.h - b.w * b.h);
+  const kept = [];
+  for (const c of candidates) {
+    const dupe = kept.findIndex((k) => iou(c, k) > 0.6);
+    if (dupe === -1) kept.push(c);
+    else if (squareness(c) > squareness(kept[dupe]) + 0.03) kept[dupe] = c; // keep the squarest
+  }
+  // Large boxes first:
+  //  - contains several icons → merged group… or folder: set aside, fine measurement will decide;
+  //  - contains a single box almost as large but squarer (icon + label) → drop the enclosing one;
+  //  - otherwise it's an icon, and what it contains (its inner artwork) is ignored.
+  kept.sort((a, b) => b.w * b.h - a.w * a.h);
+  const final = [], groups = [];
+  for (const c of kept) {
+    if (final.some((f) => overlap(c, f) > 0.5 * c.w * c.h)) continue;
+    if (groups.some((g) => iou(c, g) > 0.6)) continue;
+    const area = c.w * c.h;
+    const children = kept.filter((k) => k !== c && overlap(k, c) > 0.8 * k.w * k.h && k.w * k.h > 0.12 * area);
+    const big = children.filter((k) => k.w * k.h > 0.55 * area);
+    if (big.some((k) => squareness(k) > squareness(c) + 0.03)) continue;
+    if (!big.length && children.length >= 2) { groups.push({ ...c, group: true }); continue; }
+    final.push(c);
+  }
+  return final.concat(groups);
+}
+
+/* ---------- Fine edge measurement (full resolution) ---------- */
+
+// For each side, scan lines perpendicular to the edge, taken from the straight part
+// of the side (iOS icon corners are "squircles" that curve over ~1/3 of the side).
+// The real edge is a straight line: the color jump sits at the same spot on
+// almost every line, unlike the inner artwork or the wallpaper.
+// reach: half-width of the search zone around the estimated edge (as a fraction of the size);
+// outer: take the outermost strong peak (otherwise the strongest, if the zone is wide).
+// Returns for each side { p: edge position (continuous coordinate), ok: reliable measurement }.
+function measureEdges(px, W, H, b, reach = 0.1, outer = true) {
+  const s = (b.w + b.h) / 2, win = Math.max(3, Math.round(reach * s)), n = 24;
+  const at = (x, y) => {
+    x = x < 0 ? 0 : x >= W ? W - 1 : x; y = y < 0 ? 0 : y >= H ? H - 1 : y;
+    return (y * W + x) * 4;
+  };
+  const res = {};
+  for (const side of ['L', 'R', 'T', 'B']) {
+    const horiz = side === 'L' || side === 'R';
+    const e0 = side === 'L' ? b.x : side === 'R' ? b.x + b.w : side === 'T' ? b.y : b.y + b.h;
+    const lo = Math.round(e0 - win), len = 2 * win + 1;
+    const g = new Float32Array(n * len);
+    for (let k = 0; k < n; k++) {
+      const u = Math.round(horiz ? b.y + b.h * (0.38 + 0.24 * k / (n - 1)) : b.x + b.w * (0.38 + 0.24 * k / (n - 1)));
+      for (let j = 0; j < len; j++) {
+        const t = lo + j; // edge between pixels t-1 and t
+        const i = horiz ? at(t - 1, u) : at(u, t - 1), q = horiz ? at(t, u) : at(u, t);
+        g[k * len + j] = Math.abs(px[i] - px[q]) + Math.abs(px[i + 1] - px[q + 1]) + Math.abs(px[i + 2] - px[q + 2]);
+      }
+    }
+    // consistency: value exceeded by ~70% of lines (inner artwork doesn't cover every line)
+    const A = new Float32Array(len), col = new Float32Array(n);
+    for (let j = 0; j < len; j++) {
+      for (let k = 0; k < n; k++) col[k] = g[k * len + j];
+      col.sort();
+      A[j] = col[Math.floor(n * 0.3)];
+    }
+    let max = 0;
+    for (let j = 0; j < len; j++) max = Math.max(max, A[j]);
+    // outermost peak among the strong peaks (the icon outline, not its artwork)
+    const outward = side === 'L' || side === 'T';
+    let pk = -1;
+    for (let jj = 0; jj < len; jj++) {
+      const j = outward ? jj : len - 1 - jj;
+      const prev = j > 0 ? A[j - 1] : -1, next = j < len - 1 ? A[j + 1] : -1;
+      if (A[j] >= (outer ? 0.5 : 1) * max && A[j] >= prev && A[j] >= next) { pk = j; break; }
+    }
+    // sub-pixel precision (parabola fit on the peak)
+    let off = 0;
+    if (pk > 0 && pk < len - 1) {
+      const a = A[pk - 1], c = A[pk + 1], d = a - 2 * A[pk] + c;
+      if (d < 0) off = Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / d));
+    }
+    const sorted = [...A].sort((x, y) => x - y), med = sorted[len >> 1];
+    // reliable if the jump is sharp, consistent, and stands out clearly from the rest of the window
+    const ok = pk >= 0 && max >= 18 && max >= 2.2 * med + 6;
+    res[side] = { p: lo + pk + off, ok, v: max };
+  }
+  return res;
+}
+
+function confirmCell(b, m, need) {
+  // sharp edges found near their expected place (the coarse size may be slightly off)
+  const ref = { L: b.x, R: b.x + b.w, T: b.y, B: b.y + b.h };
+  return ['L', 'R', 'T', 'B'].filter((k) => m[k].ok && Math.abs(m[k].p - ref[k]) <= 0.1 * b.w).length >= need;
+}
+
+const median = (arr) => {
+  if (!arr.length) return NaN;
+  const s = [...arr].sort((a, b) => a - b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+// Measured center and size of an icon on one axis; falls back to the coarse box if an edge is missing.
+// (two edges not at the right distance from each other: inconsistent measurement, ignored)
+function axisFit(m, a, b, c0, S) {
+  if (m[a].ok && m[b].ok) {
+    if (Math.abs(m[b].p - m[a].p - S) <= 0.04 * S) return { c: (m[a].p + m[b].p) / 2, ok: 2 };
+    return { c: c0, ok: 0 };
+  }
+  if (m[a].ok) return { c: m[a].p + S / 2, ok: 1 };
+  if (m[b].ok) return { c: m[b].p - S / 2, ok: 1 };
+  return { c: c0, ok: 0 };
+}
+
+// Grid mode: common size, shared rows, shared columns per block
+// (the dock forms its own block: its columns don't necessarily line up with the grid's).
+function alignGrid(approx, meas) {
+  const sizes = [];
+  meas.forEach((m) => {
+    if (m.L.ok && m.R.ok) sizes.push(m.R.p - m.L.p);
+    if (m.T.ok && m.B.ok) sizes.push(m.B.p - m.T.p);
+  });
+  const S0 = median(approx.map((b) => (b.w + b.h) / 2));
+  // outlier sizes (inner edge taken for the outline) discarded before the median
+  let S = median(sizes.filter((v) => Math.abs(v - S0) < 0.15 * S0));
+  if (!(S > 0)) S = S0;
+  const fit = approx.map((b, i) => ({
+    x: axisFit(meas[i], 'L', 'R', b.x + b.w / 2, S),
+    y: axisFit(meas[i], 'T', 'B', b.y + b.h / 2, S),
+  }));
+  // rows: center = median of measured centers (most reliable first)
+  const level = (list, key) => Math.max(...list.map((i) => fit[i][key].ok));
+  const best = (list, key) => {
+    const lvl = level(list, key);
+    return median(list.filter((i) => fit[i][key].ok === lvl).map((i) => fit[i][key].c));
+  };
+  const groups = (idx, key, ref) => {
+    const sorted = [...idx].sort((a, b) => ref(a) - ref(b)), out = [];
+    for (const i of sorted) {
+      const g = out[out.length - 1];
+      if (g && ref(i) - ref(g[g.length - 1]) < 0.5 * S) g.push(i); else out.push([i]);
+    }
+    return out;
+  };
+  const all = approx.map((b, i) => i);
+  const rows = groups(all, 'y', (i) => approx[i].y + approx[i].h / 2).map((g) => ({ g, c: best(g, 'y') }));
+  // blocks: consecutive rows separated by the grid's regular pitch
+  const gaps = rows.slice(1).map((r, i) => r.c - rows[i].c);
+  // grid pitch = most frequent gap (a spurious row must not skew it)
+  const support = (g) => gaps.filter((h) => Math.abs(h - g) < 0.04 * g).length;
+  const pitch = gaps.reduce((a, g) => (support(g) > support(a) || (support(g) === support(a) && g < a) ? g : a), gaps[0] || 0);
+  const blocks = [];
+  rows.forEach((r, i) => {
+    if (i && Math.abs(gaps[i - 1] - pitch) < 0.04 * pitch) blocks[blocks.length - 1].push(r);
+    else blocks.push([r]);
+  });
+  const cx = new Float64Array(approx.length), cy = new Float64Array(approx.length);
+  // main block (most icons) first: its columns serve as fallback for the other blocks
+  const size = (blk) => blk.reduce((n, r) => n + r.g.length, 0);
+  blocks.sort((a, b) => size(b) - size(a));
+  const mainCols = [];
+  blocks.forEach((blk, bi) => {
+    const idx = blk.flatMap((r) => r.g);
+    for (const r of blk) for (const i of r.g) cy[i] = r.c;
+    for (const col of groups(idx, 'x', (i) => approx[i].x + approx[i].w / 2)) {
+      let c = best(col, 'x');
+      if (!bi) mainCols.push(c);
+      else if (!level(col, 'x')) {
+        // no reliable measurement in this column: align to the main grid if it's close
+        const near = mainCols.reduce((a, v) => (Math.abs(v - c) < Math.abs(a - c) ? v : a), Infinity);
+        if (Math.abs(near - c) < 0.15 * S) c = near;
+      }
+      for (const i of col) cx[i] = c;
+    }
+  });
+  return approx.map((b, i) => ({ x: cx[i] - S / 2, y: cy[i] - S / 2, w: S, h: S }));
+}
+
+// Off-grid: each icon keeps its own (square) measurement; a box without at least
+// 3 real straight edges is not an icon (texture, face, text…).
+// A "group" box (enclosing several smaller ones) is kept only if its 4 edges are sharp and
+// form a square: it's then a folder, and its content (mini-icons) is ignored.
+function looseBoxes(approx, meas, px, W, H) {
+  let cand = [];
+  approx.forEach((b, i) => {
+    const m = meas[i], nOk = ['L', 'R', 'T', 'B'].filter((k) => m[k].ok).length;
+    if (nOk < (b.group ? 4 : 3)) return;
+    const w = m.L.ok && m.R.ok ? m.R.p - m.L.p : NaN, h = m.T.ok && m.B.ok ? m.B.p - m.T.p : NaN;
+    const ref = (b.w + b.h) / 2, ms = [w, h].filter((v) => v > 0);
+    // the measurement must be square and stay close to the coarse box (wider tolerance
+    // when both dimensions are measured and agree)
+    if (ms.length === 2 && Math.abs(w - h) > 0.08 * Math.max(w, h)) return;
+    const tol = ms.length === 2 ? [0.75, 1.3] : [0.85, 1.15];
+    if (ms.some((v) => v < tol[0] * ref || v > tol[1] * ref)) return;
+    const S = ms.length ? median(ms) : ref;
+    const x = axisFit(m, 'L', 'R', b.x + b.w / 2, S).c - S / 2, y = axisFit(m, 'T', 'B', b.y + b.h / 2, S).c - S / 2;
+    if (x < -1 || y < -1 || x + S > W + 1 || y + S > H + 1) return; // overflows the image
+    cand.push({ x, y, w: S, h: S, q: nOk });
+  });
+  const folders = findFolders(cand, px, W, H);
+  // circle (avatar, button, badge…): not an icon
+  cand = cand.filter((c) => squircleCorners(px, W, H, c) >= 3).concat(folders);
+  // best measured (then largest) first; anything contained in an icon
+  // already kept (its logo, a folder's mini-icons, a duplicate) is ignored
+  cand.sort((a, b) => b.q - a.q || b.w - a.w);
+  const out = [];
+  for (const c of cand) {
+    if (out.some((k) => overlap(c, k) > 0.3 * c.w * c.h)) continue;
+    out.push({ x: c.x, y: c.y, w: c.w, h: c.h });
+  }
+  return out;
+}
+
+// "Full" corners: near each corner's diagonal, an icon squircle is still inside,
+// a circle already outside. Compare the color there with the color just inside
+// and just outside the neighboring edges. Returns the number of full corners (0 to 4).
+function squircleCorners(px, W, H, b) {
+  const S = b.w;
+  const col = (u, v) => {
+    const x = Math.min(W - 1, Math.max(0, Math.round(b.x + u * S))), y = Math.min(H - 1, Math.max(0, Math.round(b.y + v * S)));
+    const i = (y * W + x) * 4;
+    return [px[i], px[i + 1], px[i + 2]];
+  };
+  const d = (a, c) => Math.abs(a[0] - c[0]) + Math.abs(a[1] - c[1]) + Math.abs(a[2] - c[2]);
+  let full = 0;
+  for (const [sx, sy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+    const f = (t, s) => (s ? 1 - t : t); // coordinate measured from the corner
+    const p = col(f(0.12, sx), f(0.12, sy));
+    const inn = [col(f(0.06, sx), f(0.32, sy)), col(f(0.32, sx), f(0.06, sy))];
+    const out = [col(f(-0.04, sx), f(0.32, sy)), col(f(0.32, sx), f(-0.04, sy))];
+    const di = Math.min(...inn.map((c) => d(p, c))), dout = Math.min(...out.map((c) => d(p, c)));
+    // full: looks like the inner edge, or at least clearly different from the outside (busy icon)
+    if (di <= dout || dout > 60) full++;
+  }
+  return full;
+}
+
+// Folder seen off-grid: its mini-icons (≥ 3 neighbors, same size, tight pitch ≈ 1.2 × their size,
+// rows filled from the top left) are detected as icons. Measure the presumed folder
+// around them: if it has 4 sharp, square edges, it takes precedence (its content will be ignored).
+function findFolders(boxes, px, W, H) {
+  const cx = (b) => b.x + b.w / 2, cy = (b) => b.y + b.h / 2;
+  const linked = (a, b) => Math.abs(a.w - b.w) < 0.2 * a.w &&
+    Math.abs(cx(a) - cx(b)) < 1.5 * a.w && Math.abs(cy(a) - cy(b)) < 1.5 * a.w;
+  const seen = new Set(), out = [];
+  for (const b of boxes) {
+    if (seen.has(b)) continue;
+    const grp = [b];
+    seen.add(b);
+    for (let i = 0; i < grp.length; i++) for (const k of boxes) if (!seen.has(k) && linked(grp[i], k)) { seen.add(k); grp.push(k); }
+    if (grp.length < 3) continue;
+    const s = median(grp.map((k) => k.w));
+    const xs = grp.map(cx).sort((a, c) => a - c), ys = grp.map(cy).sort((a, c) => a - c);
+    const steps = xs.slice(1).map((v, i) => v - xs[i]).concat(ys.slice(1).map((v, i) => v - ys[i])).filter((d) => d > 0.6 * s);
+    const pitch = steps.length ? median(steps) : 1.2 * s;
+    const F = 4 * pitch; // 3 mini-icons + 2 margins ≈ 4 pitches
+    const margin = (F - 2 * pitch - s) / 2;
+    const guess = { x: xs[0] - s / 2 - margin, y: ys[0] - s / 2 - margin, w: F, h: F };
+    const m = measureEdges(px, W, H, guess, 0.12);
+    if (!['L', 'R', 'T', 'B'].every((k) => m[k].ok)) continue;
+    const w = m.R.p - m.L.p, h = m.B.p - m.T.p;
+    if (Math.abs(w - h) > 0.06 * w || Math.abs(w - F) > 0.15 * F) continue;
+    const S = (w + h) / 2;
+    out.push({ x: (m.L.p + m.R.p - S) / 2, y: (m.T.p + m.B.p - S) / 2, w: S, h: S, q: 5 });
+  }
+  return out;
+}
+
+// Red badge at the top right of the icon (measured at full resolution).
+function findBadge(px, W, H, icon) {
+  const s = Math.max(icon.w, icon.h);
+  const x0 = Math.max(0, Math.round(icon.x + 0.5 * s)), x1 = Math.min(W - 1, Math.round(icon.x + 1.4 * s));
+  const y0 = Math.max(0, Math.round(icon.y - 0.4 * s)), y1 = Math.min(H - 1, Math.round(icon.y + 0.5 * s));
+  if (x1 <= x0 || y1 <= y0) return null;
+  const redness = (x, y) => {
+    const i = (y * W + x) * 4, r = px[i];
+    return r > 150 ? r - Math.max(px[i + 1], px[i + 2]) : 0;
+  };
+  const isRed = (x, y) => {
+    const i = (y * W + x) * 4, r = px[i], g = px[i + 1], b = px[i + 2];
+    return r > 170 && r - g > 90 && r - b > 80;
+  };
+  // seed: red pixels outside the icon (above or to the right), so as not to confuse with red icon artwork
+  const bw = x1 - x0 + 1, seen = new Uint8Array(bw * (y1 - y0 + 1));
+  const stack = [];
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const outside = y < icon.y || x >= icon.x + icon.w;
+    if (outside && isRed(x, y)) { stack.push(x, y); seen[(y - y0) * bw + x - x0] = 1; }
+  }
+  if (stack.length / 2 < s * s * 0.004) return null;
+  let minX = W, minY = H, maxX = 0, maxY = 0;
+  while (stack.length) {
+    const y = stack.pop(), x = stack.pop();
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + (d === 0) - (d === 1), ny = y + (d === 2) - (d === 3);
+      if (nx < x0 || ny < y0 || nx > x1 || ny > y1) continue;
+      const q = (ny - y0) * bw + nx - x0;
+      if (seen[q]) continue;
+      seen[q] = 1;
+      if (isRed(nx, ny)) stack.push(nx, ny);
+    }
+  }
+  const w = maxX - minX + 1, h = maxY - minY + 1;
+  if (h < 0.12 * s || h > 0.6 * s || w > 1.2 * s || w < 0.8 * h) return null; // not a badge
+  if (maxX >= x1 || minY <= y0) return null; // touches the edge of the zone: it's something else (neighboring icon…)
+  // anti-aliased edge: extend by half a pixel per side if the neighboring row / column is still slightly red
+  const fringe = (xa, ya, xb, yb) => {
+    let m = 0;
+    for (let y = Math.max(0, ya); y <= Math.min(H - 1, yb); y++) for (let x = Math.max(0, xa); x <= Math.min(W - 1, xb); x++) m = Math.max(m, redness(x, y));
+    return m > 40 ? 0.5 : 0;
+  };
+  const l = fringe(minX - 1, minY, minX - 1, maxY), r = fringe(maxX + 1, minY, maxX + 1, maxY);
+  const t = fringe(minX, minY - 1, maxX, minY - 1), b = fringe(minX, maxY + 1, maxX, maxY + 1);
+  return { x: minX - l, y: minY - t, w: w + l + r, h: h + t + b };
+}
+
+/* ---------- Grid mode (home screen) ---------- */
+
+// Score of a square: share of points on each side (straight part, excluding rounded corners)
+// that land on an edge. Keep the weakest of the 4 sides.
+// need: minimum expected score; bail out (0) as soon as it becomes unreachable (fast scan).
+function sideScore(m, W, x, y, s, need = 0) {
+  const n = 10, maxMiss = n - Math.ceil(need * n - 1e-9);
+  const o = sideOffsets(s);
+  // the 4 sides are walked in parallel: an empty side triggers the earliest bail-out
+  const top = y * W + x, bottom = (y + s - 1) * W + x, right = top + s - 1;
+  let c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+  for (let k = 0; k < n; k++) {
+    const ok = o[k], ov = ok * W, lim = k + 1 - maxMiss;
+    if (m[top + ok]) c0++; else if (c0 < lim) return 0;
+    if (m[bottom + ok]) c1++; else if (c1 < lim) return 0;
+    if (m[top + ov]) c2++; else if (c2 < lim) return 0;
+    if (m[right + ov]) c3++; else if (c3 < lim) return 0;
+  }
+  return Math.min(c0, c1, c2, c3) / n;
+}
+
+// positions of the 10 points along a side (straight part), cached per size (called very often)
+function sideOffsets(s) {
+  let o = sideOffsets.cache[s];
+  if (!o) {
+    o = sideOffsets.cache[s] = new Int32Array(10);
+    for (let k = 0; k < 10; k++) o[k] = Math.round(s * (0.25 + 0.5 * k / 9));
+  }
+  return o;
+}
+sideOffsets.cache = {};
+
+// Interior near the edge is uniform (icon background) and different from the outside.
+function ringScore(px, W, H, x, y, s) {
+  const n = 10, ins = Math.max(2, Math.round(s * 0.1)), ou = Math.max(2, Math.round(s * 0.06));
+  const o = sideOffsets(s);
+  const inC = ringScore.inC, outC = ringScore.outC;
+  let ni = 0, no = 0;
+  // 4 points per position along the edge: 2 horizontal sides, 2 vertical (inside then outside)
+  for (let k = 0; k < n; k++) {
+    const ok = o[k];
+    for (let j = 0; j < 8; j++) {
+      const d = j < 4 ? ins : -ou, inside = j < 4;
+      const side = j & 3;
+      const qx = side < 2 ? x + ok : side === 2 ? x + d : x + s - 1 - d;
+      const qy = side < 2 ? (side === 0 ? y + d : y + s - 1 - d) : y + ok;
+      if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+      const i = (qy * W + qx) * 4;
+      if (inside) { inC[ni * 3] = px[i]; inC[ni * 3 + 1] = px[i + 1]; inC[ni * 3 + 2] = px[i + 2]; ni++; }
+      else { outC[no * 3] = px[i]; outC[no * 3 + 1] = px[i + 1]; outC[no * 3 + 2] = px[i + 2]; no++; }
+    }
+  }
+  if (!ni) return { uni: 0, diff: 0 };
+  // median color of the inner edge, channel by channel
+  const v = ringScore.ch.subarray(0, ni);
+  const med = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    for (let j = 0; j < ni; j++) v[j] = inC[j * 3 + c];
+    med[c] = kth(v, ni >> 1);
+  }
+  let u = 0, df = 0;
+  for (let j = 0; j < ni; j++) {
+    if (Math.abs(inC[j * 3] - med[0]) + Math.abs(inC[j * 3 + 1] - med[1]) + Math.abs(inC[j * 3 + 2] - med[2]) < 45) u++;
+  }
+  for (let j = 0; j < no; j++) {
+    if (Math.abs(outC[j * 3] - med[0]) + Math.abs(outC[j * 3 + 1] - med[1]) + Math.abs(outC[j * 3 + 2] - med[2]) > 45) df++;
+  }
+  return { uni: u / ni, diff: df / Math.max(1, no) };
+}
+ringScore.inC = new Uint8Array(120); ringScore.outC = new Uint8Array(120); ringScore.ch = new Uint8Array(40);
+
+// k-th smallest value (quickselect, modifies the array)
+function kth(a, k) {
+  let lo = 0, hi = a.length - 1;
+  while (lo < hi) {
+    const piv = a[(lo + hi) >> 1];
+    let i = lo, j = hi;
+    while (i <= j) {
+      while (a[i] < piv) i++;
+      while (a[j] > piv) j--;
+      if (i <= j) { const t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+    }
+    if (k <= j) hi = j; else if (k >= i) lo = i; else return a[k];
+  }
+  return a[k];
+}
+
+// "Confident" squares: 4 sharp sides, uniform inner edge, contrast with the outside.
+// Ignore small squares contained in a larger one (e.g. a folder's mini-icons).
+function findSquares(px, grad, W, H) {
+  const N = W * H, minDim = Math.min(W, H);
+
+  const e = new Uint8Array(N);
+  for (let p = 0; p < N; p++) e[p] = grad[p] > 24 ? 1 : 0;
+  // thickened edges: tolerates a coarse scan step
+  const m = dilate(e, W, H, Math.max(2, Math.round(minDim / 200)));
+  const seeds = [];
+  for (let S = minDim * 0.06; S <= minDim * 0.45; S *= 1.04) {
+    const s = Math.round(S), step = Math.max(1, Math.round(s / 16));
+    for (let y = 0; y + s < H; y += step) for (let x = 0; x + s < W; x += step) {
+      const e = sideScore(m, W, x, y, s, 0.7);
+      if (e < 0.7) continue;
+      const { uni, diff } = ringScore(px, W, H, x, y, s);
+      const score = e * (0.5 + 0.5 * uni) * diff;
+      if (score >= 0.5) seeds.push({ x, y, w: s, h: s, score });
+    }
+  }
+  seeds.sort((a, b) => b.score - a.score);
+  const strong = [];
+  // remove duplicates only between squares of similar size: a small sharp square inside
+  // an icon (logo, folder mini-icon) must not hide the icon itself (sorted below)
+  for (const c of seeds) if (!strong.some((k) => iou(c, k) > 0.3 && Math.max(c.w, k.w) < 1.3 * Math.min(c.w, k.w))) strong.push(c);
+  return strong.filter((c) => !strong.some((k) => k.w > c.w * 1.3 && overlap(c, k) > 0.7 * c.w * c.h));
+}
+
+function detectGrid(px, grad, W, H, outer) {
+  const N = W * H;
+  const edgeMap = (T, R) => { const e = new Uint8Array(N); for (let p = 0; p < N; p++) e[p] = grad[p] > T ? 1 : 0; return dilate(e, W, H, R); };
+
+  // b) Dominant size
+  // for each candidate size, measure how well the squares form a grid (shared columns AND rows)
+  const cluster = (vals, tol) => {
+    vals = [...vals].sort((a, b) => a - b);
+    const out = [];
+    for (const v of vals) {
+      const last = out[out.length - 1];
+      if (last && v - last.v / last.n < tol) { last.v += v; last.n++; } else out.push({ v, n: 1 });
+    }
+    return out.map((c) => ({ c: c.v / c.n, n: c.n }));
+  };
+  const near = (cl, v) => cl.reduce((a, c) => (Math.abs(c.c - v) < Math.abs(a.c - v) ? c : a));
+  let best = [], bestQ = 0;
+  for (const c of outer) {
+    const g = outer.filter((k) => Math.abs(k.w - c.w) <= 0.1 * c.w);
+    if (g.length < 5) continue;
+    const tol = 0.4 * c.w;
+    const cx = cluster(g.map((b) => b.x + b.w / 2), tol), cy = cluster(g.map((b) => b.y + b.h / 2), tol);
+    const aligned = g.filter((b) => near(cx, b.x + b.w / 2).n >= 2 && near(cy, b.y + b.h / 2).n >= 2).length;
+    const q = (aligned * aligned / (cx.length * cy.length)) * c.w;
+    if (q > bestQ) { bestQ = q; best = g; }
+  }
+  if (best.length < 5) return null;
+  const S = best.map((b) => b.w).sort((a, b) => a - b)[best.length >> 1];
+
+  // c) Columns (at least 2 confident icons) and rows
+  const tol = 0.4 * S;
+  // two icons don't overlap: lines closer than 0.8 × the size are duplicates
+  // (keep the best supported)
+  const distinct = (cl) => {
+    const out = [];
+    for (const c of [...cl].sort((a, b) => b.n - a.n)) if (!out.some((o) => Math.abs(o.c - c.c) < 0.8 * S)) out.push(c);
+    return out.map((c) => c.c);
+  };
+  const colCl = cluster(best.map((b) => b.x + b.w / 2), tol);
+  let cols = distinct(colCl.filter((c) => c.n >= 2));
+  // a row may contain just one confident icon (e.g. the dock), if it's in a known column
+  const onCol = best.filter((b) => cols.some((c) => Math.abs(c - (b.x + b.w / 2)) < tol));
+  let rows = distinct(cluster(onCol.map((b) => b.y + b.h / 2), tol));
+  if (cols.length < 2 || rows.length < 2) return null;
+  // missing columns / rows: also try one grid pitch before/after and in the gaps
+  const extend = (lines, max) => {
+    if (lines.length < 2) return lines;
+    const pitch = Math.min(...lines.slice(1).map((v, i) => v - lines[i]));
+    const extra = [];
+    for (let v = lines[0] - pitch; v - S / 2 >= -0.05 * S; v -= pitch) extra.push(v);
+    for (let v = lines[lines.length - 1] + pitch; v + S / 2 <= max + 0.05 * S; v += pitch) extra.push(v);
+    for (let i = 1; i < lines.length; i++) for (let v = lines[i - 1] + pitch; v < lines[i] - 0.6 * pitch; v += pitch) extra.push(v);
+    return lines.concat(extra);
+  };
+  cols = extend(cols.sort((a, b) => a - b), W);
+  rows = extend(rows.sort((a, b) => a - b), H);
+
+  // d) Check each cell, with a slight realignment.
+  //    A doubtful cell (light icon on light background…) is kept as "to confirm": the fine
+  //    full-resolution measurement will decide (detectIcons).
+  const mLow = edgeMap(14, 1);
+  const found = [];
+  const r = Math.round(0.2 * S);
+  for (const cy of rows) for (const cx of cols) {
+    let bestCell = null;
+    for (const f of [0.94, 1, 1.06]) {
+      const s = Math.round(S * f);
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        const x = Math.round(cx - s / 2 + dx), y = Math.round(cy - s / 2 + dy);
+        if (x < 0 || y < 0 || x + s >= W || y + s >= H) continue;
+        const e = sideScore(mLow, W, x, y, s);
+        if (!bestCell || e > bestCell.e) bestCell = { x, y, w: s, h: s, e };
+      }
+    }
+    if (!bestCell) continue;
+    const { diff } = ringScore(px, W, H, bestCell.x, bestCell.y, bestCell.w);
+    if (bestCell.e < 0.85 || diff < 0.4) {
+      // re-centered on the grid (realignment found nothing reliable)
+      bestCell = { x: cx - S / 2, y: cy - S / 2, w: S, h: S, e: 0, weak: true };
+      if (bestCell.x < 0 || bestCell.y < 0 || bestCell.x + S > W || bestCell.y + S > H) continue;
+    }
+    found.push(bestCell);
+  }
+  // only one cell per slot
+  found.sort((a, b) => b.e - a.e);
+  const cells = [];
+  for (const c of found) if (!cells.some((k) => iou(c, k) > 0.2)) cells.push(c);
+  return cells.filter((c) => !c.weak).length >= 4 ? cells : null;
+}
+
+function looksLikeText(b, boxes) {
+  let close = 0;
+  for (const o of boxes) {
+    if (o === b) continue;
+    const hr = o.h / b.h;
+    if (hr < 0.4 || hr > 2.5) continue;
+    const vOverlap = Math.min(b.y + b.h, o.y + o.h) - Math.max(b.y, o.y);
+    if (vOverlap < 0.5 * Math.min(b.h, o.h)) continue;
+    const gap = Math.max(o.x - (b.x + b.w), b.x - (o.x + o.w));
+    if (gap < 0.45 * b.h) close++;
+  }
+  return close >= 1;
+}
+
+function components(mask, W, H) {
+  const seen = new Uint8Array(W * H);
+  const stack = new Int32Array(W * H);
+  const out = [];
+  for (let s = 0; s < W * H; s++) {
+    if (!mask[s] || seen[s]) continue;
+    let sp = 0, minX = W, minY = H, maxX = 0, maxY = 0;
+    stack[sp++] = s; seen[s] = 1;
+    while (sp) {
+      const p = stack[--sp];
+      const x = p % W, y = (p / W) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        const q = ny * W + nx;
+        if (mask[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
+      }
+    }
+    out.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 });
+  }
+  return out;
+}
+
+function integral(src, W, H) {
+  const w1 = W + 1, S = new Int32Array(w1 * (H + 1));
+  for (let y = 0; y < H; y++) {
+    let row = 0;
+    for (let x = 0; x < W; x++) {
+      row += src[y * W + x];
+      S[(y + 1) * w1 + x + 1] = S[y * w1 + x + 1] + row;
+    }
+  }
+  return S;
+}
+
+function iou(a, b) {
+  const o = overlap(a, b);
+  return o / (a.w * a.h + b.w * b.h - o);
+}
+
+function dilate(src, W, H, R) {
+  // separable square dilation via sliding sums
+  const tmp = new Uint8Array(W * H), out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    let sum = 0;
+    const row = y * W;
+    for (let x = -R; x < W + R; x++) {
+      const add = x + R, rem = x - R - 1;
+      if (add < W && add >= 0) sum += src[row + add];
+      if (rem >= 0 && rem < W) sum -= src[row + rem];
+      if (x >= 0 && x < W) tmp[row + x] = sum > 0 ? 1 : 0;
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let sum = 0;
+    for (let y = -R; y < H + R; y++) {
+      const add = y + R, rem = y - R - 1;
+      if (add < H && add >= 0) sum += tmp[add * W + x];
+      if (rem >= 0 && rem < H) sum -= tmp[rem * W + x];
+      if (y >= 0 && y < H) out[y * W + x] = sum > 0 ? 1 : 0;
+    }
+  }
+  return out;
+}
+
+function overlap(a, b) {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+
+/* ---------- Explosions ----------
+ * Each detected icon (+ its badge) is a "target". Tapping it shatters it: the icon is cut into
+ * shards by a radial fracture centered on the tap point (like glass), the shards fly outward,
+ * tumble (fake 3D flip) and fall; sparks, debris, a flash and a shockwave go with it.
+ * The hole left in the screenshot is blurred (same as the blurred zones of Aura Fluid).
+ */
+const fx = $('fx'), ctx = fx.getContext('2d');
+let targets = [];     // { b (rel union rect), cut (rel icon rect), els, tex, colors, alive }
+let shards = [], particles = [], blasts = [], respawns = [];
+let rafId = 0, lastNow = 0, shake = null;
+
+function runDetection() {
+  if (!currentImage) return;
+  const icons = detectIcons(currentImage);
+  stage.querySelectorAll('.icon-box').forEach((el) => el.remove());
+  shards = []; particles = []; blasts = []; respawns = [];
+  const pct = (el, b) => Object.assign(el.style, {
+    left: b.x * 100 + '%', top: b.y * 100 + '%', width: b.w * 100 + '%', height: b.h * 100 + '%',
+  });
+  const boxEls = icons.map((b) => {
+    const el = document.createElement('div');
+    el.className = b.badge ? 'icon-box badge' : 'icon-box';
+    pct(el, b);
+    stage.appendChild(el);
+    return el;
+  });
+
+  // one texture per target: the icon (rounded corners) + its badge, cut from the original image
+  const nw = currentImage.naturalWidth, nh = currentImage.naturalHeight;
+  targets = [];
+  icons.forEach((icon, i) => {
+    if (icon.badge) return;
+    const badges = icons.map((k, j) => j).filter((j) => icons[j].badge && icons[j].of === i);
+    const parts = [{ c: icon.cut, badge: false }, ...badges.map((j) => ({ c: icons[j].cut, badge: true }))];
+    const x0 = Math.min(...parts.map((q) => q.c.x)), y0 = Math.min(...parts.map((q) => q.c.y));
+    const x1 = Math.max(...parts.map((q) => q.c.x + q.c.w)), y1 = Math.max(...parts.map((q) => q.c.y + q.c.h));
+    const b = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(b.w * nw)); cv.height = Math.max(1, Math.round(b.h * nh));
+    const c2 = cv.getContext('2d', { willReadFrequently: true });
+    for (const q of parts) {
+      const x = (q.c.x - x0) * nw, y = (q.c.y - y0) * nh, w = q.c.w * nw, h = q.c.h * nh;
+      c2.save();
+      c2.beginPath();
+      c2.roundRect(x, y, w, h, q.badge ? Math.min(w, h) / 2 : 0.225 * Math.min(w, h));
+      c2.clip();
+      c2.drawImage(currentImage, q.c.x * nw, q.c.y * nh, w, h, x, y, w, h);
+      c2.restore();
+    }
+    targets.push({ b, cut: icon.cut, els: [boxEls[i], ...badges.map((j) => boxEls[j])], tex: cv, colors: palette(c2, cv), alive: true });
+  });
+  resize(); render();
+}
+
+// a few representative colors of the icon (for the debris)
+function palette(c2, cv) {
+  const d = c2.getImageData(0, 0, cv.width, cv.height).data, out = [];
+  for (let k = 0; k < 24; k++) {
+    const x = Math.floor(cv.width * (0.15 + 0.7 * Math.random())), y = Math.floor(cv.height * (0.15 + 0.7 * Math.random()));
+    const i = (y * cv.width + x) * 4;
+    if (d[i + 3] > 200) out.push(`rgb(${d[i]},${d[i + 1]},${d[i + 2]})`);
+  }
+  return out.length ? out : ['#ccc'];
+}
+
+// target rect in viewport CSS px
+function screenRect(t) {
+  const r = img.getBoundingClientRect();
+  return { x: r.left + t.b.x * r.width, y: r.top + t.b.y * r.height, w: t.b.w * r.width, h: t.b.h * r.height };
+}
+
+function hitTest(cx, cy) {
+  const r = img.getBoundingClientRect();
+  const u = (cx - r.left) / r.width, v = (cy - r.top) / r.height;
+  let best = null, bd = Infinity;
+  for (const t of targets) {
+    if (!t.alive) continue;
+    const m = 0.08 * Math.max(t.cut.w, t.cut.h);
+    if (u < t.b.x - m || u > t.b.x + t.b.w + m || v < t.b.y - m || v > t.b.y + t.b.h + m) continue;
+    const d = Math.hypot(u - (t.cut.x + t.cut.w / 2), v - (t.cut.y + t.cut.h / 2));
+    if (d < bd) { bd = d; best = t; }
+  }
+  return best;
+}
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function explode(t, tx, ty) {
+  t.alive = false;
+  t.els.forEach((el) => el.classList.add('gone'));
+  respawns = respawns.filter((r) => r.t !== t);
+  const R = screenRect(t), S = Math.max(R.w, R.h);
+  // fracture center: the tap point, kept inside the icon
+  const ox = Math.min(R.x + R.w * 0.9, Math.max(R.x + R.w * 0.1, tx));
+  const oy = Math.min(R.y + R.h * 0.9, Math.max(R.y + R.h * 0.1, ty));
+  const maxR = Math.max(...[[R.x, R.y], [R.x + R.w, R.y], [R.x, R.y + R.h], [R.x + R.w, R.y + R.h]]
+    .map(([x, y]) => Math.hypot(x - ox, y - oy))) * 1.08;
+
+  // radial fracture: K rings × NS sectors, jittered vertices (small shards near the impact)
+  const K = 3, NS = 7 + Math.floor(Math.random() * 3);
+  const a0 = Math.random() * Math.PI * 2;
+  const V = [];
+  for (let k = 1; k <= K; k++) {
+    const row = [];
+    for (let j = 0; j < NS; j++) {
+      const a = a0 + (j + rnd(-0.32, 0.32)) * (2 * Math.PI / NS);
+      const r = maxR * Math.pow((k + (k < K ? rnd(-0.25, 0.25) : 0)) / K, 1.35);
+      row.push([ox + r * Math.cos(a), oy + r * Math.sin(a)]);
+    }
+    V.push(row);
+  }
+  const polys = [];
+  for (let j = 0; j < NS; j++) {
+    const j2 = (j + 1) % NS;
+    polys.push([[ox, oy], V[0][j], V[0][j2]]);
+    for (let k = 0; k < K - 1; k++) {
+      const q = [V[k][j], V[k][j2], V[k + 1][j2], V[k + 1][j]];
+      if (Math.random() < 0.55) { polys.push([q[0], q[1], q[2]]); polys.push([q[0], q[2], q[3]]); }
+      else polys.push(q);
+    }
+  }
+  const speed = S * 5;
+  for (const P of polys) {
+    // skip shards entirely outside the icon
+    if (P.every(([x]) => x < R.x) || P.every(([x]) => x > R.x + R.w) || P.every(([, y]) => y < R.y) || P.every(([, y]) => y > R.y + R.h)) continue;
+    const cx = P.reduce((s, p) => s + p[0], 0) / P.length, cy = P.reduce((s, p) => s + p[1], 0) / P.length;
+    const dx = cx - ox, dy = cy - oy, d = Math.hypot(dx, dy) || 1;
+    const k = (1.25 - 0.6 * Math.min(1, d / maxR)) * rnd(0.6, 1.3);
+    const ang = Math.atan2(dy, dx) + rnd(-0.35, 0.35);
+    shards.push({
+      tex: t.tex, R, x0: cx, y0: cy, x: cx, y: cy,
+      pts: P.map(([x, y]) => [x - cx, y - cy]),
+      vx: Math.cos(ang) * speed * k, vy: Math.sin(ang) * speed * k - S * rnd(2, 5),
+      rot: 0, vr: rnd(-14, 14), flip: 0, vf: rnd(-12, 12),
+      age: 0, life: rnd(1.6, 2.6),
+    });
+  }
+
+  // sparks (additive streaks), debris (icon colors), smoke
+  for (let i = 0; i < 46; i++) {
+    const a = Math.random() * Math.PI * 2, v = S * rnd(6, 16);
+    particles.push({ kind: 'spark', x: ox, y: oy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, age: 0, life: rnd(0.25, 0.6),
+      color: ['#fff6d5', '#ffd166', '#ff9f43', '#ff6b3d'][i % 4], w: rnd(1, 2.4) });
+  }
+  for (let i = 0; i < 40; i++) {
+    const a = Math.random() * Math.PI * 2, v = S * rnd(2, 9);
+    particles.push({ kind: 'debris', x: ox + rnd(-0.3, 0.3) * R.w, y: oy + rnd(-0.3, 0.3) * R.h, vx: Math.cos(a) * v, vy: Math.sin(a) * v - S * 3,
+      age: 0, life: rnd(0.9, 1.7), color: t.colors[i % t.colors.length], s: S * rnd(0.025, 0.06), rot: rnd(0, 6), vr: rnd(-20, 20) });
+  }
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * Math.PI * 2, v = S * rnd(0.4, 1.4);
+    particles.push({ kind: 'smoke', x: ox, y: oy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - S * 0.6, age: 0, life: rnd(0.8, 1.3), s: S * rnd(0.25, 0.45) });
+  }
+  blasts.push({ x: ox, y: oy, S, age: 0 });
+  shake = { age: 0, amp: Math.min(14, S * 0.09) };
+  navigator.vibrate?.(35);
+  boom(S);
+  start();
+}
+
+/* ---------- Sound: short synthesized boom (noise burst + low thump) ---------- */
+let audio = null;
+function boom(S) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const a = audio, t = a.currentTime, dur = 0.7;
+    const buf = a.createBuffer(1, Math.floor(a.sampleRate * dur), a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const lp = a.createBiquadFilter(); lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(3200, t); lp.frequency.exponentialRampToValueAtTime(260, t + dur);
+    const g = a.createGain(); g.gain.setValueAtTime(0.35, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(lp).connect(g).connect(a.destination); src.start(t);
+    const o = a.createOscillator(), og = a.createGain();
+    o.frequency.setValueAtTime(140 - Math.min(60, S * 0.3), t); o.frequency.exponentialRampToValueAtTime(38, t + 0.35);
+    og.gain.setValueAtTime(0.5, t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+    o.connect(og).connect(a.destination); o.start(t); o.stop(t + 0.45);
+  } catch (e) { /* no audio: fine */ }
+}
+
+/* ---------- Animation ---------- */
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1, W = innerWidth, H = innerHeight;
+  if (fx.width !== Math.round(W * dpr) || fx.height !== Math.round(H * dpr)) {
+    fx.width = Math.round(W * dpr); fx.height = Math.round(H * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', () => { resize(); render(); });
+
+function start() {
+  if (rafId) return;
+  lastNow = performance.now();
+  rafId = requestAnimationFrame(tick);
+}
+
+function tick(now) {
+  const dt = Math.min(0.04, (now - lastNow) / 1000); lastNow = now;
+  const GRAV = Math.max(innerHeight, 600) * 3.2, H = innerHeight;
+  for (const s of shards) {
+    s.age += dt;
+    s.vx *= Math.exp(-1.2 * dt); s.vy *= Math.exp(-1.2 * dt);
+    s.vy += GRAV * dt;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    s.rot += s.vr * dt; s.flip += s.vf * dt;
+  }
+  shards = shards.filter((s) => s.age < s.life && s.y < H + 200);
+  for (const p of particles) {
+    p.age += dt;
+    const drag = p.kind === 'spark' ? 5 : p.kind === 'smoke' ? 2.5 : 1.5;
+    p.vx *= Math.exp(-drag * dt); p.vy *= Math.exp(-drag * dt);
+    if (p.kind === 'debris') p.vy += GRAV * dt;
+    if (p.kind === 'spark') p.vy += GRAV * 0.25 * dt;
+    if (p.kind === 'smoke') p.vy -= 30 * dt;
+    if (p.rot !== undefined) p.rot += p.vr * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  particles = particles.filter((p) => p.age < p.life);
+  for (const b of blasts) b.age += dt;
+  blasts = blasts.filter((b) => b.age < 0.6);
+  for (const r of respawns) r.age += dt;
+  respawns = respawns.filter((r) => {
+    if (r.age < 0.42) return true;
+    r.t.alive = true;
+    r.t.els.forEach((el) => el.classList.remove('gone'));
+    return false;
+  });
+  if (shake) {
+    shake.age += dt;
+    const k = Math.max(0, 1 - shake.age / 0.35), a = shake.amp * k * k;
+    stage.style.transform = k > 0 ? `translate(${rnd(-a, a)}px, ${rnd(-a, a)}px)` : '';
+    if (k <= 0) shake = null;
+  }
+  render();
+  if (shards.length || particles.length || blasts.length || respawns.length || shake) rafId = requestAnimationFrame(tick);
+  else { rafId = 0; render(); }
+}
+
+function render() {
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  // re-forming icons (pop back in with a small overshoot)
+  for (const r of respawns) {
+    if (r.age <= 0) continue;
+    const R = screenRect(r.t), x = Math.min(1, r.age / 0.42);
+    const c1 = 1.9, k = 1 + (c1 + 1) * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); // easeOutBack
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, x * 3);
+    ctx.translate(R.x + R.w / 2, R.y + R.h / 2);
+    ctx.scale(k, k);
+    ctx.drawImage(r.t.tex, -R.w / 2, -R.h / 2, R.w, R.h);
+    ctx.restore();
+  }
+  // smoke (behind)
+  for (const p of particles) {
+    if (p.kind !== 'smoke') continue;
+    const x = p.age / p.life, s = p.s * (1 + 1.8 * x);
+    const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, s);
+    g.addColorStop(0, `rgba(70,70,75,${0.35 * (1 - x)})`); g.addColorStop(1, 'rgba(70,70,75,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, s, 0, Math.PI * 2); ctx.fill();
+  }
+  // shards
+  for (const s of shards) {
+    const fade = Math.min(1, (s.life - s.age) / 0.35), c = Math.cos(s.flip);
+    ctx.save();
+    ctx.globalAlpha = fade;
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.rot);
+    ctx.scale(Math.abs(c) < 0.08 ? 0.08 * Math.sign(c || 1) : c, 1);
+    ctx.beginPath();
+    s.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+    ctx.save();
+    ctx.clip();
+    ctx.drawImage(s.tex, s.R.x - s.x0, s.R.y - s.y0, s.R.w, s.R.h);
+    // seen edge-on / from behind: darker; glint when it turns
+    const shade = (1 - Math.abs(c)) * 0.55 + (c < 0 ? 0.25 : 0);
+    if (shade > 0.01) { ctx.fillStyle = `rgba(0,0,0,${shade})`; ctx.fill(); }
+    const glint = Math.pow(Math.max(0, Math.sin(s.flip * 2)), 12) * 0.5;
+    if (glint > 0.01) { ctx.fillStyle = `rgba(255,255,255,${glint})`; ctx.fill(); }
+    ctx.restore();
+    ctx.restore();
+  }
+  // debris
+  for (const p of particles) {
+    if (p.kind !== 'debris') continue;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, (p.life - p.age) / 0.3);
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-p.s / 2, -p.s / 2, p.s, p.s * 0.7);
+    ctx.restore();
+  }
+  // additive: flash, shockwave, sparks
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const b of blasts) {
+    const fl = Math.max(0, 1 - b.age / 0.2);
+    if (fl > 0) {
+      const r = b.S * (0.4 + 1.4 * (1 - fl));
+      const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, r);
+      g.addColorStop(0, `rgba(255,250,230,${fl})`);
+      g.addColorStop(0.35, `rgba(255,190,90,${0.7 * fl})`);
+      g.addColorStop(1, 'rgba(255,90,30,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.x, b.y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    const x = b.age / 0.6, rr = b.S * (0.3 + 2.6 * (1 - Math.pow(1 - x, 3)));
+    ctx.strokeStyle = `rgba(255,230,190,${0.55 * (1 - x)})`;
+    ctx.lineWidth = Math.max(0.5, b.S * 0.08 * (1 - x));
+    ctx.beginPath(); ctx.arc(b.x, b.y, rr, 0, Math.PI * 2); ctx.stroke();
+  }
+  for (const p of particles) {
+    if (p.kind !== 'spark') continue;
+    const k = 1 - p.age / p.life;
+    ctx.strokeStyle = p.color; ctx.globalAlpha = k; ctx.lineWidth = p.w; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.03, p.y - p.vy * 0.03); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ---------- Input ---------- */
+
+// Touch an icon → it explodes
+viewer.addEventListener('pointerdown', (e) => {
+  const t = hitTest(e.clientX, e.clientY);
+  if (t) explode(t, e.clientX, e.clientY);
+});
+
+// Bring every exploded icon back
+function restoreAll() {
+  let delay = 0;
+  for (const t of targets) {
+    if (t.alive || respawns.some((r) => r.t === t)) continue;
+    respawns.push({ t, age: -delay });
+    delay += 0.03;
+  }
+  start();
+}
+$('resetBtn').addEventListener('click', (e) => { e.stopPropagation(); restoreAll(); });
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') restoreAll();
+  if (e.key === 'd' || e.key === 'D') stage.classList.toggle('debug');
+});
+
+</script>
+</body>
+</html>
